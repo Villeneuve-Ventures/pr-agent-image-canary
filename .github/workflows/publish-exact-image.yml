@@ -1,0 +1,83 @@
+name: Publish exact qualified OCI
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    if: github.repository == 'Villeneuve-Ventures/pr-agent-image-canary'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/villeneuve-ventures/pr-agent-corrected
+      TAG: corrected-3bcccc82790c
+      RELEASE: tested-3bcccc82790c
+      ARCHIVE_SHA: 0da16b934cb41f2bf963690fa2cdca25d18cd25d5411c5a0aae3df7982680b3a
+      MANIFEST_SHA: 3bcccc82790c8dff4b58f3ea9805b225a79023cc6a69f3efab34c3e8ae53a36b
+    steps:
+      - name: Copy immutable bytes and read them back
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          command -v skopeo
+          skopeo --version
+          docker version
+          gh --version
+          skopeo copy --help | grep -- '--preserve-digests'
+          mkdir "$RUNNER_TEMP/source-oci"
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --pattern pr-agent-corrected-linux-amd64.oci.tar --dir "$RUNNER_TEMP/source-oci"
+          archive="$RUNNER_TEMP/source-oci/pr-agent-corrected-linux-amd64.oci.tar"
+          printf '%s  %s\n' "$ARCHIVE_SHA" "$archive" | sha256sum --check
+          test "$(stat -c %s "$archive")" = 219016704
+          auth="$RUNNER_TEMP/pr-agent-registry-auth.json"
+          trap 'rm -f "$auth"' EXIT
+          printf '%s' "$GH_TOKEN" | skopeo login --authfile "$auth" --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          # A pre-existing different tag is a conflict, never an overwrite target.
+          probe="$RUNNER_TEMP/tag-before.json"
+          probe_error="$RUNNER_TEMP/tag-before.stderr"
+          publish_needed=false
+          if skopeo inspect --authfile "$auth" --raw "docker://$IMAGE:$TAG" > "$probe" 2> "$probe_error"; then
+            printf '%s  %s\n' "$MANIFEST_SHA" "$probe" | sha256sum --check
+          else
+            cat "$probe_error" >&2
+            PROBE_ERROR="$probe_error" python3 - <<'PYPROBE'
+          import os, pathlib, re
+          message = pathlib.Path(os.environ['PROBE_ERROR']).read_text()
+          known_absence = re.search(r': (?:manifest unknown|name unknown)["\s]*$', message, re.IGNORECASE)
+          other_failure = re.search(r'(?i)unauthori[sz]ed|authentication|forbidden|denied|timeout|timed out|no such host|TLS|certificate|connection|unexpected status|429|500|502|503', message)
+          assert known_absence and not other_failure, 'Registry state is unknown; hold without publishing'
+          PYPROBE
+            publish_needed=true
+          fi
+          if "$publish_needed"; then
+            skopeo copy --preserve-digests --dest-authfile "$auth" \
+              "oci-archive:$archive" "docker://$IMAGE:$TAG"
+          fi
+          skopeo inspect --authfile "$auth" --raw "docker://$IMAGE:$TAG" > "$RUNNER_TEMP/pushed-manifest.json"
+          printf '%s  %s\n' "$MANIFEST_SHA" "$RUNNER_TEMP/pushed-manifest.json" | sha256sum --check
+          skopeo copy --preserve-digests --src-authfile "$auth" \
+            "docker://$IMAGE@sha256:$MANIFEST_SHA" "oci:$RUNNER_TEMP/readback:verified"
+          ARCHIVE="$archive" READBACK="$RUNNER_TEMP/readback" python3 - <<'PY'
+          import hashlib, json, os, pathlib, tarfile
+          def digest(data): return hashlib.sha256(data).hexdigest()
+          with tarfile.open(os.environ['ARCHIVE']) as source:
+              original = json.load(source.extractfile('index.json'))['manifests'][0]
+              layout = pathlib.Path(os.environ['READBACK'])
+              received = json.loads((layout/'index.json').read_text())['manifests'][0]
+              assert original['digest'] == received['digest'] == 'sha256:' + os.environ['MANIFEST_SHA']
+              manifest_path = 'blobs/sha256/' + original['digest'].split(':')[1]
+              old = source.extractfile(manifest_path).read()
+              new = (layout/manifest_path).read_bytes()
+              assert new == old and digest(new) == os.environ['MANIFEST_SHA']
+              manifest = json.loads(new)
+              for descriptor in [manifest['config'], *manifest['layers']]:
+                  path = 'blobs/sha256/' + descriptor['digest'].split(':')[1]
+                  a = source.extractfile(path).read()
+                  b = (layout/path).read_bytes()
+                  assert b == a and digest(b) == descriptor['digest'].split(':')[1]
+              print(json.dumps({'exact_manifest': original['digest'], 'all_config_layer_bytes_equal': True}))
+          PY

@@ -1,0 +1,8 @@
+# Synthetic canary configuration; provider/model parameters match the reviewed target.
+[config]
+model = "gemini/gemini-3.8-flash"
+fallback_models = ["gemini/gemini-3.5-flash-lite"]
+reasoning_effort = "high"
+temperature = 1.0
+max_model_tokens = 265536
+max_output_tokens = 65536
