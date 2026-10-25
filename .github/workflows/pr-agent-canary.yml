@@ -1,4 +1,4 @@
-name: Native PR-Agent image canary
+name: Native PR-Agent injected-fallback canary
 
 on:
   issue_comment:
@@ -34,6 +34,31 @@ jobs:
             *) echo "::error::PR-Agent commands require repository write permission."; exit 1 ;;
           esac
 
+      - name: Stage reviewed synthetic transport fault helper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = Villeneuve-Ventures/pr-agent-image-canary
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          dest="$GITHUB_WORKSPACE/canary_transport"
+          mkdir -m 700 "$dest"
+          gh api --method GET --header 'Accept: application/vnd.github.raw+json' "repos/Villeneuve-Ventures/pr-agent-image-canary/contents/canary_transport/sitecustomize.py?ref=$GITHUB_SHA" > "$dest/sitecustomize.py.part"
+          python3 - "$dest" <<'PYCODE'
+          import hashlib, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          part = root/'sitecustomize.py.part'
+          if root.is_symlink() or part.is_symlink() or sorted(p.name for p in root.iterdir()) != ['sitecustomize.py.part']:
+              raise SystemExit('CANARY_STAGE_LAYOUT')
+          data = part.read_bytes()
+          if len(data) != 6127 or hashlib.sha256(data).hexdigest() != '5bd0e0b0a3adf039acbcd018fc1c88ae09abe667cfa7ffa1085361c3c42fb20c':
+              raise SystemExit('CANARY_STAGE_HASH')
+          compile(data, '/github/workspace/canary_transport/sitecustomize.py', 'exec')
+          part.rename(root/'sitecustomize.py')
+          (root/'sitecustomize.py').chmod(0o444)
+          root.chmod(0o555)
+          PYCODE
+
       - name: Run upstream PR-Agent command
         # PR-Agent v0.48.0, source 981344be2755e303df501e18e3f60b848a188a80.
         uses: docker://ghcr.io/villeneuve-ventures/pr-agent-corrected@sha256:3bcccc82790c8dff4b58f3ea9805b225a79023cc6a69f3efab34c3e8ae53a36b
@@ -48,6 +73,30 @@ jobs:
             import re
             from pathlib import Path
 
+            import hashlib
+            import stat
+            import sys
+            
+            try:
+                helper = Path('/github/workspace/canary_transport/sitecustomize.py')
+                if (os.environ.get('PR_AGENT_CANARY_TRANSPORT') != 'constructed-primary-400-v1'
+                        or os.environ.get('PYTHONPATH') != '/github/workspace/canary_transport:/app'
+                        or sys.flags.no_site):
+                    raise SystemExit('CANARY_PREFLIGHT_ENV')
+                if helper.is_symlink() or helper.parent.is_symlink():
+                    raise SystemExit('CANARY_PREFLIGHT_LINK')
+                info = helper.stat()
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o444:
+                    raise SystemExit('CANARY_PREFLIGHT_MODE')
+                if stat.S_IMODE(helper.parent.stat().st_mode) != 0o555:
+                    raise SystemExit('CANARY_PREFLIGHT_DIRECTORY')
+                data = helper.read_bytes()
+                if len(data) != 6127 or hashlib.sha256(data).hexdigest() != '5bd0e0b0a3adf039acbcd018fc1c88ae09abe667cfa7ffa1085361c3c42fb20c':
+                    raise SystemExit('CANARY_PREFLIGHT_HASH')
+                compile(data, str(helper), 'exec')
+            except BaseException:
+                raise SystemExit('CANARY_PREFLIGHT_FAILED') from None
+
             event_path = Path(os.environ['GITHUB_EVENT_PATH'])
             event = json.loads(event_path.read_text(encoding='utf-8'))
             body = event.get('comment', {}).get('body', '')
@@ -59,6 +108,9 @@ jobs:
             "
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AGENT_CANARY_TRANSPORT: constructed-primary-400-v1
+          PYTHONPATH: /github/workspace/canary_transport:/app
+          PYTHONUNBUFFERED: '1'
           GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           config.model: gemini/gemini-3.8-flash
           config.fallback_models: '["gemini/gemini-3.5-flash-lite"]'
